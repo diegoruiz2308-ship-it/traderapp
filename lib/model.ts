@@ -5,6 +5,8 @@ const required=z.string().trim().min(1,'Completa los campos obligatorios.').max(
 const date=z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(v=>!Number.isNaN(Date.parse(v))&&new Date(v).toISOString().slice(0,10)===v,'Fecha no válida');
 const time=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 const stamp=z.string().datetime();
+// Session-local wall time, deliberately without UTC conversion or an inferred zone.
+const localMoment=z.string().refine(v=>v.length===16&&v[10]==='T'&&date.safeParse(v.slice(0,10)).success&&time.safeParse(v.slice(11)).success,'Fecha y hora local no válidas');
 export const ruleKeys=['entry','risk','limit'] as const;
 export const ruleLabels={entry:'Entrada',risk:'Riesgo',limit:'Límite de sesión'};
 export const statusLabels={yes:'Cumple',no:'Incumple',unknown:'No evaluable',na:'No aplica'};
@@ -14,7 +16,7 @@ export const planSchema=z.object({id,version:z.number().int().positive(),market:
 const assessmentSchema=z.object({status:z.enum(['yes','no','unknown','na']),reason:note});
 export const decisionSchema=z.object({id,time,type:z.enum(['trade','wait','pause','end']),fact:required,result:z.enum(['loss','gain','flat','unknown','na']),checks:z.object({entry:assessmentSchema,risk:assessmentSchema,limit:assessmentSchema})});
 export const episodeSchema=z.object({id,planId:id,date,session:required,source:z.enum(['current','historical','simulation']),loss:z.enum(['yes','no','uncertain']),lossTime:z.union([time,z.literal('')]),lossNote:note,coverage:z.enum(['complete','partial','unknown']),decisions:z.array(decisionSchema).max(100),context:note,reflection:note,reviewed:z.boolean(),createdAt:stamp,updatedAt:stamp});
-export const practiceSchema=z.object({id,episodeId:id,rule:z.enum(ruleKeys),action:required,when:required,active:z.boolean(),createdAt:stamp,reports:z.array(z.object({id,date,episodeId:z.union([id,z.literal('')]),result:z.enum(['applied','not_applied','no_opportunity']),note:required})).max(100)});
+export const practiceSchema=z.object({id,episodeId:id,rule:z.enum(ruleKeys),action:required,when:required,active:z.boolean(),createdAt:stamp,effectiveFrom:localMoment.optional(),reports:z.array(z.object({id,date,time:time.optional(),decisionId:id.optional(),episodeId:z.union([id,z.literal('')]),result:z.enum(['applied','not_applied','no_opportunity']),note:required})).max(100)});
 export const stateSchema=z.object({consentAt:z.union([stamp,z.literal('')]),plans:z.array(planSchema).max(100),episodes:z.array(episodeSchema).max(500),practices:z.array(practiceSchema).max(500)}).strict().superRefine((s,ctx)=>{
  const problem=(message:string)=>ctx.addIssue({code:z.ZodIssueCode.custom,message});
  const unique=(xs:{id:string}[])=>new Set(xs.map(x=>x.id)).size===xs.length;
@@ -41,6 +43,8 @@ export const stateSchema=z.object({consentAt:z.union([stamp,z.literal('')]),plan
    if(new Set(linked).size!==linked.length)problem('La oportunidad ya tiene un seguimiento.');
    for(const r of p.reports){
      if(r.date>today())problem('El seguimiento no puede tener fecha futura.');
+     // Legacy practices have no provable effective moment: preserve them without credit.
+     if(p.effectiveFrom&&!reportHasTemporalCredit(p,r,s.episodes))problem('El seguimiento necesita una fecha y hora demostrable igual o posterior al momento efectivo de la práctica.');
      if(r.result!=='no_opportunity'&&(!r.episodeId||!episodeIds.has(r.episodeId)))problem('Vincula la oportunidad con un episodio posterior.');
      if(r.episodeId){const target=s.episodes.find(e=>e.id===r.episodeId);if(!target||target.id===p.episodeId||!!source&&(target.date<source.date||target.planId!==source.planId||target.source!==source.source)||target.date!==r.date)problem('La oportunidad debe pertenecer a otro episodio posterior y tener su fecha.');}
    }
@@ -73,3 +77,20 @@ export function counts(episodes:Episode[]){
 export function weekKey(date:string){const d=new Date(date+'T12:00:00Z');d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7));return d.toISOString().slice(0,10);}
 export const formatDate=(v:string)=>new Intl.DateTimeFormat('es',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(new Date(v+'T12:00:00Z'));
 export function newDecision():Decision{return {id:uid(),time:'',type:'trade',fact:'',result:'unknown',checks:{entry:{status:'unknown',reason:''},risk:{status:'unknown',reason:''},limit:{status:'unknown',reason:''}}};}
+
+export const localNow=()=>{const d=new Date();return [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-')+'T'+[d.getHours(),d.getMinutes()].map(v=>String(v).padStart(2,'0')).join(':');};
+export function decisionIsEffective(practice:Practice,episode:Episode,decision:Decision){
+ const moment=episode.date+'T'+decision.time;
+ return !!practice.effectiveFrom&&localMoment.safeParse(practice.effectiveFrom).success&&localMoment.safeParse(moment).success&&moment>=practice.effectiveFrom;
+}
+export function reportHasTemporalCredit(practice:Practice,report:Practice['reports'][number],episodes:Episode[]){
+ if(!practice.effectiveFrom||!localMoment.safeParse(practice.effectiveFrom).success)return false;
+ if(report.result==='no_opportunity'){
+  // A date alone cannot establish the order within that day.
+  const moment=report.date+'T'+report.time;
+  return localMoment.safeParse(moment).success&&moment>=practice.effectiveFrom;
+ }
+ const episode=episodes.find(e=>e.id===report.episodeId);
+ const decision=episode?.decisions.find(d=>d.id===report.decisionId);
+ return !!episode&&!!decision&&episode.date===report.date&&decisionIsEffective(practice,episode,decision);
+}
